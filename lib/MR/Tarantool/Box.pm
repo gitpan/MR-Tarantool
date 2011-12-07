@@ -4,6 +4,8 @@ package MR::Tarantool::Box;
 
 =head1 NAME
 
+MR::Tarantool::Box
+
 A driver for an efficient Tarantool/Box NoSQL in-memory storage.
 
 =head1 SYNOPSIS
