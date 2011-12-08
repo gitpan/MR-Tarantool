@@ -13,6 +13,8 @@ use Carp qw/confess/;
 use Test::More tests => 218;
 use Test::Exception;
 
+use List::MoreUtils qw/zip/;
+
 local $SIG{__DIE__} = \&confess;
 
 our $CLASS;
@@ -517,6 +519,40 @@ foreach my $r (@res) {
 	ok sub { return $r != $tuples->[-1] && $r != $tuples->[-2] };
 }
 
+
+my $flds = [qw/ f1 f2 f3 f4 /];
+sub def_param_flds {
+    my $format = 'l&&&';
+    return { servers => $server,
+             spaces => [ {
+                 indexes => [ {
+                     index_name   => 'id',
+                     keys         => [0],
+                 } ],
+                 space         => 27,
+                 format        => $format,
+                 default_index => 'id',
+                 fields        => $flds,
+             } ],
+             debug => 0,
+         }
+}
+
+$box = $CLASS->new(def_param_flds);
+ok $box->isa($CLASS), 'connect';
+
+do {
+    my $tuples = [ @$tuples[0..2] ];
+    foreach my $tuple (@$tuples) {
+        cleanup $tuple->[0];
+    }
+
+    foreach my $tuple (@$tuples) {
+        ok $box->Insert(@$tuple), "flds/insert \'$tuple->[0]\'";
+    }
+
+    is_deeply [$box->Select([[$tuples->[0]->[0]]])], [{zip @$flds, @{$tuples->[0]}}], 'select by primary_num1 index';
+};
 
 
 
