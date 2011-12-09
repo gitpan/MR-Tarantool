@@ -1,3 +1,7 @@
+#!/usr/bin/perl
+
+# Tarantool/Box config below
+
 use strict;
 use warnings;
 BEGIN {
@@ -7,10 +11,9 @@ BEGIN {
 }
 use FindBin qw($Bin);
 use lib "$Bin";
-#use TBox ();
 use Carp qw/confess/;
 
-use Test::More tests => 218;
+use Test::More tests => 234;
 use Test::Exception;
 
 use List::MoreUtils qw/zip/;
@@ -548,10 +551,16 @@ do {
     }
 
     foreach my $tuple (@$tuples) {
-        ok $box->Insert(@$tuple), "flds/insert \'$tuple->[0]\'";
+        is_deeply [$box->Insert(@$tuple, {want_inserted_tuple => 1})], [{zip @$flds, @$tuple}], "flds/insert \'$tuple->[0]\'";
     }
 
     is_deeply [$box->Select([[$tuples->[0]->[0]]])], [{zip @$flds, @{$tuples->[0]}}], 'select by primary_num1 index';
+    is_deeply [$box->UpdateMulti($tuples->[0]->[0],[ $flds->[3] => set => $tuples->[0]->[3] ],{want_updated_tuple => 1})], [{zip @$flds, @{$tuples->[0]}}], 'update1';
+    ok         $box->UpdateMulti($tuples->[0]->[0],[ $flds->[3] => set => $tuples->[0]->[3] ]), 'update2';
+    is_deeply [$box->UpdateMulti($tuples->[0]->[0],[ 3          => set => $tuples->[0]->[3] ],{want_updated_tuple => 1})], [{zip @$flds, @{$tuples->[0]}}], 'update3';
+    ok         $box->UpdateMulti($tuples->[0]->[0],[ 3          => set => $tuples->[0]->[3] ]), 'update4';
+
+    is_deeply [$box->Delete($tuples->[0]->[0],{want_deleted_tuple => 1})], [{zip @$flds, @{$tuples->[0]}}], 'update3';
 };
 
 
@@ -588,3 +597,68 @@ foreach my $tuple (@$tuples) {
 }
 
 is_deeply($tuples, [$box->Select([map $_->[0], @$tuples])]);
+
+
+__END__
+
+space[0].enabled = 1
+space[0].index[0].type = "HASH"
+space[0].index[0].unique = 1
+space[0].index[0].key_field[0].fieldno = 0
+space[0].index[0].key_field[0].type = "NUM"
+space[0].index[1].type = "HASH"
+space[0].index[1].unique = 1
+space[0].index[1].key_field[0].fieldno = 1
+space[0].index[1].key_field[0].type = "STR"
+
+space[20].enabled = 1
+space[20].index[0].type = "HASH"
+space[20].index[0].unique = 1
+space[20].index[0].key_field[0].fieldno = 0
+space[20].index[0].key_field[0].type = "NUM64"
+
+
+space[26].enabled = 1
+space[26].index[0].type = "HASH"
+space[26].index[0].unique = 1
+space[26].index[0].key_field[0].fieldno = 0
+space[26].index[0].key_field[0].type = "NUM"
+space[26].index[1].type = "TREE"
+space[26].index[1].unique = 0
+space[26].index[1].key_field[0].fieldno = 1
+space[26].index[1].key_field[0].type = "STR"
+space[26].index[2].type = "TREE"
+space[26].index[2].unique = 0
+space[26].index[2].key_field[0].fieldno = 1
+space[26].index[2].key_field[0].type = "STR"
+space[26].index[2].key_field[1].fieldno = 2
+space[26].index[2].key_field[1].type = "NUM"
+
+
+
+space[27].enabled = 1
+space[27].index[0].type = "HASH"
+space[27].index[0].unique = 1
+space[27].index[0].key_field[0].fieldno = 0
+space[27].index[0].key_field[0].type = "NUM"
+space[27].index[1].type = "HASH"
+space[27].index[1].unique = 1
+space[27].index[1].key_field[0].fieldno = 1
+space[27].index[1].key_field[0].type = "STR"
+
+space[27].index[2].type = "TREE"
+space[27].index[2].unique = 1
+space[27].index[2].key_field[0].fieldno = 2
+space[27].index[2].key_field[0].type = "STR"
+
+space[27].index[2].type = "TREE"
+space[27].index[2].unique = 1
+space[27].index[2].key_field[0].fieldno = 3
+space[27].index[2].key_field[0].type = "STR"
+
+space[27].index[3].type = "TREE"
+space[27].index[3].unique = 1
+space[27].index[3].key_field[0].fieldno = 2
+space[27].index[3].key_field[0].type = "STR"
+space[27].index[3].key_field[1].fieldno = 3
+space[27].index[3].key_field[1].type = "STR"

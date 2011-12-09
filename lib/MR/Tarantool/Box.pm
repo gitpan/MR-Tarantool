@@ -31,7 +31,7 @@ A driver for an efficient Tarantool/Box NoSQL in-memory storage.
         } ],
         default_space => "primary",
 
-        timeout   => 1,
+        timeout   => 1.0,                 # seconds
         retry     => 3,
         debug     => 9,                   # output to STDERR some debugging info
         raise     => 0,                   # dont raise an exception in case of error
@@ -142,9 +142,20 @@ C<pack()>-compatible tuple format string, allowed formats: C<QqLlSsCc&>,
 where C<&> stands for bytestring. C<Qq> usable only if perl supports
 int64 itself. Tuples' fields are packed/unpacked according to this C<format>.
 
-=item B<hashify> => $arg
+=item B<hashify> => B<$coderef>
 
-Override C<hashify> option (see below).
+Specify a callback to turn each tuple into a good-looking hash.
+It receives C<space> id and resultset as arguments. No return value needed.
+
+    $coderef = sub {
+        my ($space_id, $resultset) = @_;
+        $_ = { FieldName1 => $_->[0], FieldName2 => $_->[1], ... } for @$resultset;
+    };
+
+=item B<fields> => B<$arrayref>
+
+Specify an arrayref of fields names according to C<format> to turn each
+tuple into a good-looking hash. Names must begin with C<< [A-Za-z] >>.
 
 =item B<indexes> => [ \%index, ... ]
 
@@ -178,21 +189,6 @@ Must be set if there are more than one C<\%index>es.
 
 Space C<space> or C<name> to be used by default. Must be set if there are
 more than one C<\%space>s.
-
-=item B<hashify> => B<$coderef>
-
-Specify a callback to turn each tuple into a good-looking hash.
-It receives C<space> id and resultset as arguments. No return value needed.
-
-    $coderef = sub {
-        my ($space_id, $resultset) = @_;
-        $_ = { FieldName1 => $_->[0], FieldName2 => $_->[1], ... } for @$resultset;
-    };
-
-=item B<fields> => B<$arrayref>
-
-Specify an arrayref of fields names according to C<format> to turn each
-tuple into a good-looking hash.
 
 =item B<timeout> => $timeout_fractional_seconds_float || 23
 
@@ -313,6 +309,8 @@ sub new {
         if($ns->{fields}) {
             confess "space[$namespace] fields must be ARRAYREF" unless ref $ns->{fields} eq 'ARRAY';
             confess "space[$namespace] fields number must match format" if @{$ns->{fields}} != @f;
+            m/^[A-Za-z]/ or confess "space[$namespace] fields names must begin with [A-Za-z]: bad name $_" for @{$ns->{fields}};
+            $ns->{fields_hash} = { map { $ns->{fields}->[$_] => $_ } 0..$#{$ns->{fields}} };
         }
     }
     $self->{namespaces} = \%namespaces;
@@ -551,15 +549,15 @@ The difference between them is the behaviour concerning tuple with the same prim
 
 =item *
 
-B<Add> will fail if a duplicate-key tuple B<exists> 
+B<Add> will succeed if and only if duplicate-key tuple B<does not exist> 
 
 =item *
 
-B<Replace> will fail if a duplicate-key tuple B<does not exists> 
+B<Replace> will succeed if and only if a duplicate-key tuple B<exists> 
 
 =item *
 
-B<Set> will B<overwrite> a duplicate-key tuple 
+B<Set> will suddeed B<anyway>. Duplicate-key tuple will be B<overwritten>
 
 =back
 
@@ -584,12 +582,16 @@ sub Replace { # store tuple if tuple identified by primary key _does_ exist
 }
 
 sub Insert {
-    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/_flags action/);
+    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/want_result want_inserted_tuple _flags action/);
     my ($self, @tuple) = @_;
 
     $self->_debug("$self->{name}: INSERT(NS:$namespace->{namespace},TUPLE:[@{[map {qq{`$_'}} @tuple]}])") if $self->{debug} >= 3;
 
+    $param->{want_result} = $param->{want_inserted_tuple} if !defined $param->{want_result};
+
     my $flags = $param->{_flags} || 0;
+    $flags |= WANT_RESULT if $param->{want_result};
+
     $param->{action} ||= 'set';
     if ($param->{action} eq 'add') {
         $flags |= INSERT_ADD;
@@ -615,12 +617,17 @@ sub Insert {
 
     $self->_debug("$self->{name}: INSERT[${\join '   ', map {join' ',unpack'(H2)*',$_} @tuple}]") if $self->{debug} >= 4;
 
-    $self->_chat (
+    my $r = $self->_chat (
         msg      => 13,
         payload  => pack("LLL (w/a*)*", $namespace->{namespace}, $flags, scalar(@tuple), @tuple),
         unpack   => sub { $self->_unpack_affected($flags, $namespace, @_) },
         callback => $param->{callback},
-    );
+    ) or return;
+
+    return $r unless $param->{want_result};
+
+    $self->_PostSelect($r, $param, $namespace);
+    return $r->[0];
 }
 
 sub _unpack_select {
@@ -663,8 +670,7 @@ sub _unpack_select_multi {
 
 sub _unpack_affected {
     my ($self, $flags, $ns) = @_;
-
-    ($flags & WANT_RESULT) ? $self->_unpack_select($ns, "AFFECTED", $_[3])->[0] : unpack('L', substr($_[3],0,4,''))||'0E0';
+    ($flags & WANT_RESULT) ? $self->_unpack_select($ns, "AFFECTED", $_[3]) : unpack('L', substr($_[3],0,4,''))||'0E0';
 }
 
 sub NPRM () { 3 }
@@ -722,12 +728,13 @@ sub _PackSelect {
 }
 
 sub _PostSelect {
-    my ($self, $r, $param) = @_;
+    my ($self, $r, $param, $namespace) = @_;
     if(!$param->{raw}) {
-        if(ref $param->{hashify} eq 'CODE') {
-            $param->{hashify}->($param->{namespace}->{namespace}, $r);
-        } elsif( $param->{namespace}->{fields} ) {
-            $_ = { zip @{$param->{namespace}->{fields}}, @$_ } for @$r;
+        my $hashify = $param->{hashify} || $namespace->{hashify} || $self->{hashify};
+        if($hashify) {
+            $hashify->($namespace->{namespace}, $r);
+        } elsif( $namespace->{fields} ) {
+            $_ = { zip @{$namespace->{fields}}, @$_ } for @$r;
         }
     }
 }
@@ -757,6 +764,8 @@ Select tuple(s) from storage
 
 Specify keys to select. All keys must be defined.
 
+Contextual behaviour:
+
 =over
 
 =item *
@@ -776,9 +785,15 @@ in the storage
 If you select C<< \@keys >> then C<< \@tuples >> will be returned upon success. C<< @tuples >> will
 be empty if there are no such keys, and false will be returned in case of error.
 
+=back
+
+Other notes:
+
+=over
+
 =item *
 
-If you select using index on multiple fields each C<< $key >> should be gives as a key-tuple C<< $key = [ $key_field1, $key_field2, ... ] >>.
+If you select using index on multiple fields each C<< $key >> should be given as a key-tuple C<< $key = [ $key_field1, $key_field2, ... ] >>.
 
 =back
 
@@ -848,7 +863,7 @@ sub Select {
 
     $param->{want} ||= !1;
 
-    $self->_PostSelect($r, { hashify => $param->{hashify}||$namespace->{hashify}||$self->{hashify}, %$param, namespace => $namespace });
+    $self->_PostSelect($r, $param, $namespace);
 
     if(defined(my $p = $param->{hash_by})) {
         my %h;
@@ -903,7 +918,7 @@ sub SelectUnion {
     confess __LINE__."$self->{name}: something wrong" if @$r != @reqs;
     my $ea = each_arrayref $r, \@reqs;
     while(my ($res, $req) = $ea->()) {
-        $self->_PostSelect($res, { hashify => $req->{namespace}->{hashify}||$self->{hashify}, %$param, %{$req->{param}}, namespace => $req->{namespace} });
+        $self->_PostSelect($res, { %$param, %{$req->{param}} }, $req->{namespace});
     }
     return $r;
 }
@@ -931,9 +946,9 @@ Delete tuple from storage. Return false upon error.
 
 Specify storage space (by id or name) to work on.
 
-=item B<want_deleted_tuples> => $bool
+=item B<want_deleted_tuple> => $bool
 
-if C<$bool> then return arrayref of deleted tuple(s).
+if C<$bool> then return deleted tuple.
 
 =back
 
@@ -942,23 +957,30 @@ if C<$bool> then return arrayref of deleted tuple(s).
 =cut
 
 sub Delete {
-    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/want_deleted_tuples/);
+    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/want_deleted_tuple want_result/);
     my ($self, $key) = @_;
 
+    $param->{want_result} = $param->{want_deleted_tuple} if !defined $param->{want_result};
+
     my $flags = 0;
-    $flags |= WANT_RESULT if $param->{want_deleted_tuple};
+    $flags |= WANT_RESULT if $param->{want_result};
 
     $self->_debug("$self->{name}: DELETE(NS:$namespace->{namespace},KEY:$key,F:$flags)") if $self->{debug} >= 3;
 
     confess "$self->{name}\->Delete: for now key cardinality of 1 is only allowed" unless 1 == @{$param->{index}->{keys}};
     $self->_pack_keys($namespace, $param->{index}, $key);
 
-    $self->_chat(
+    my $r = $self->_chat(
         msg      => $flags ? 21 : 20,
         payload  => $flags ? pack("L L a*", $namespace->{namespace}, $flags, $key) : pack("L a*", $namespace->{namespace}, $key),
         unpack   => sub { $self->_unpack_affected($flags, $namespace, @_) },
         callback => $param->{callback},
-    );
+    ) or return;
+
+    return $r unless $param->{want_result};
+
+    $self->_PostSelect($r, $param, $namespace);
+    return $r->[0];
 }
 
 sub OP_SET          () { 0 }
@@ -1017,10 +1039,12 @@ BEGIN {
 
 =pod
 
-=head3 Update
+=head3 UpdateMulti
 
-Update tuple in storage. Return false upon error.
+Apply several update operations to a tuple.
 
+    my @op = ([ f1 => add => 10 ], [ f1 => and => 0xFF], [ f2 => set => time() ], [ misc_string => cutend => 3 ]);
+    
     my $n_updated = $box->UpdateMulti($key, @op) or die $box->ErrorStr;
     my $n_updated = $box->UpdateMulti($key, @op, \%options) or die $box->ErrorStr;
     warn "Nothing was updated" unless int $n_deleted;
@@ -1028,15 +1052,20 @@ Update tuple in storage. Return false upon error.
     my $updated_tuple_set = $box->UpdateMulti($key, @op, { want_result => 1 }) or die $box->ErrorStr;
     warn "Nothing was updated" unless @$updated_tuple_set;
 
+Different fields can be updated at one shot.
+The same field can be updated more than once.
+All update operations are done atomically.
+Returns false upon error.
+
 =over
 
-=item B<@op> = ([ $field_num => $op => $value ], ...)
+=item B<@op> = ([ $field => $op => $value ], ...)
 
 =over
 
-=item B<$field_num>
+=item B<$field>
 
-Field-to-update number.
+Field-to-update number or name (see L</fields>).
 
 =item B<$op>
 
@@ -1044,25 +1073,25 @@ Field-to-update number.
 
 =item B<set>
 
-Set C<< $field_num >> field to C<< $value >>
+Set C<< $field >> to C<< $value >>
 
 =item B<add>, B<and>, B<xor>, B<or>
 
-Apply an arithmetic operation to C<< $field_num >> with argument C<< $value >>
+Apply an arithmetic operation to C<< $field >> with argument C<< $value >>
 Currently arithmetic operations are supported only for int32 (4-byte length) fields (and C<$value>s too)
 
 =item B<splice>, B<substr>
 
-Apply a perl-like L<perlfunc/splice> operation to C<< $field_num >>. B<$value> = [$OFFSET, $LENGTH, $REPLACE_WITH].
+Apply a perl-like L<perlfunc/splice> operation to C<< $field >>. B<$value> = [$OFFSET, $LENGTH, $REPLACE_WITH].
 substr is just an alias.
 
 =item B<append>, B<prepend>
 
-Append or prepend C<< $field_num >> with C<$value> string.
+Append or prepend C<< $field >> with C<$value> string.
 
 =item B<cutbeg>, B<cutend>
 
-Cut C<< $value >> bytes from beginning or end of C<< $field_num >>.
+Cut C<< $value >> bytes from beginning or end of C<< $field >>.
 
 =back 
 
@@ -1076,16 +1105,16 @@ Cut C<< $value >> bytes from beginning or end of C<< $field_num >>.
 
 Specify storage space (by id or name) to work on.
 
-=item B<want_result> => $bool
+=item B<want_updated_tuple> => $bool
 
-if C<$bool> then return arrayref of deleted tuple(s).
+if C<$bool> then return updated tuple.
 
 =back
 
 =cut
 
 sub UpdateMulti {
-    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/want_result _flags/);
+    my ($param, $namespace) = $_[0]->_validate_param(\@_, qw/want_updated_tuple want_result _flags/);
     my ($self, $key, @op) = @_;
 
     $self->_debug("$self->{name}: UPDATEMULTI(NS:$namespace->{namespace},KEY:$key)[@{[map{qq{[@$_]}}@op]}]") if $self->{debug} >= 3;
@@ -1093,14 +1122,23 @@ sub UpdateMulti {
     confess "$self->{name}\->UpdateMulti: for now key cardinality of 1 is only allowed" unless 1 == @{$param->{index}->{keys}};
     confess "$self->{name}: too many op" if scalar @op > 128;
 
+    $param->{want_result} = $param->{want_updated_tuple} if !defined $param->{want_result};
+
     my $flags = $param->{_flags} || 0;
     $flags |= WANT_RESULT if $param->{want_result};
 
     my $fmt = $namespace->{field_format};
+    my $fields_hash = $namespace->{fields_hash};
 
     foreach (@op) {
         confess "$self->{name}: bad op <$_>" if ref ne 'ARRAY' or @$_ != 3;
         my ($field_num, $op, $value) = @$_;
+
+        if($field_num =~ m/^[A-Za-z]/) {
+            confess "no such field $field_num in space $namespace->{name}($namespace->{space})" unless exists $fields_hash->{$field_num};
+            $field_num = $fields_hash->{$field_num};
+        }
+
         my $field_type = $namespace->{string_keys}->{$field_num} ? 'string' : 'number';
 
         my $is_array = 0;
@@ -1134,12 +1172,17 @@ sub UpdateMulti {
 
     $self->_pack_keys($namespace, $param->{index}, $key);
 
-    $self->_chat(
+    my $r = $self->_chat(
         msg      => 19,
         payload  => pack("LL a* L (a*)*" , $namespace->{namespace}, $flags, $key, scalar(@op), @op),
         unpack   => sub { $self->_unpack_affected($flags, $namespace, @_) },
         callback => $param->{callback},
-    );
+    ) or return;
+
+    return $r unless $param->{want_result};
+
+    $self->_PostSelect($r, $param, $namespace);
+    return $r->[0];
 }
 
 sub Update {
@@ -1187,5 +1230,22 @@ sub Num {
     push @op, [$field_num => num_add => $arg{num_add}]; # if $arg{num_add};
     $self->UpdateMulti($key, @op, $param);
 }
+
+=head1 SEE ALSO
+
+=over
+
+=item *
+
+L<http://tarantool.org>
+
+=item *
+
+L<MR::Tarantool::Box::Singleton>
+
+=back
+
+=cut
+
 
 1;
