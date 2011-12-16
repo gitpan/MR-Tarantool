@@ -530,11 +530,11 @@ sub Call {
 
 =pod
 
-=head3 Add, Set, Replace
+=head3 Add, Insert, Replace
 
-    $box->Add(@tuple) or die $box->ErrorStr;
-    $box->Set(@tuple, { space => "main" });
-    $box->Replace(@tuple, { space => "secondary" });
+    $box->Add(@tuple) or die $box->ErrorStr;         # only store a new tuple
+    $box->Replace(@tuple, { space => "secondary" }); # only store an existing tuple
+    $box->Insert(@tuple, { space => "main" });       # store anyway
 
 Insert a C<< @tuple >> into the storage into C<$options{space}> or C<default_space> space.
 All of them return C<true> upon success.
@@ -573,7 +573,7 @@ B<Replace> will succeed if and only if a duplicate-key tuple B<exists>
 
 =item *
 
-B<Set> will suddeed B<anyway>. Duplicate-key tuple will be B<overwritten>
+B<Insert> will succeed B<anyway>. Duplicate-key tuple will be B<overwritten>
 
 =back
 
@@ -605,6 +605,7 @@ sub Insert {
 
     $param->{want_result} = $param->{want_inserted_tuple} if !defined $param->{want_result};
 
+
     my $flags = $param->{_flags} || 0;
     $flags |= WANT_RESULT if $param->{want_result};
 
@@ -618,6 +619,7 @@ sub Insert {
     }
     my $chkkey = $namespace->{check_keys};
     my $fmt = $namespace->{field_format};
+    confess "Wrong fields number in tuple" if @tuple != @$fmt;
     for (0..$#tuple) {
         confess "$self->{name}: ref in tuple $_=`$tuple[$_]'" if ref $tuple[$_];
         no warnings 'uninitialized';
