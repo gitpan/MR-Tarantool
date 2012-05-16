@@ -34,6 +34,18 @@ has _pending => (
     default   => sub { {} },
 );
 
+has exceptions => (
+    is       => 'rw',
+    isa      => 'Int',
+    default  => 0,
+);
+
+has _exceptions => (
+    is       => 'ro',
+    isa      => 'ArrayRef',
+    default  => sub { [] },
+);
+
 has _waitresult => (
     is   => 'rw',
     isa  => 'ArrayRef',
@@ -48,6 +60,16 @@ around BUILDARGS => sub {
     }
     $class->$orig(%args);
 };
+
+sub runcatch {
+    my ($self, $code, @param) = @_;
+    my $ret;
+    unless(eval { $ret = &$code(@param); 1 }) {
+        push @{$self->_exceptions}, $@;
+        $self->exceptions($self->exceptions + 1);
+    }
+    return $ret;
+}
 
 sub add {
     my ($self, @p) = @_;
@@ -76,10 +98,10 @@ sub send {
         my $pend = $pending->{$shard};
         if ($pend->try < $pend->retry) {
             next unless $pend->is_timeout;
-            $pend->set_pending_mode(scalar $pend->onretry->($pend->id, $pend, $self));
+            $pend->set_pending_mode(scalar $self->runcatch($pend->onretry, ($pend->id, $pend, $self)));
         } else {
             delete $pending->{$shard};
-            $pend->onerror->($pend->id, "no success after @{[$pend->try]} retries", $pend, $self);
+            $self->runcatch($pend->onerror, ($pend->id, "no success after @{[$pend->try]} retries", $pend, $self));
         }
     }
     return $self;
@@ -89,19 +111,23 @@ sub wait {
     my ($self) = @_;
     my $pending = $self->_pending;
 
-    my $rin = '';
-    vec($rin, $_->fileno, 1) = 1 for grep { $_->is_pending } values %$pending;
-    my $ein = $rin;
+    my $in = '';
+    vec($in, $_->fileno, 1) = 1 for grep { $_->is_pending } values %$pending;
 
-    my $n = CORE::select($rin, undef, $ein, $self->itertime);
-    $self->_waitresult([$rin,$ein]);
-    if ($n < 0) {
-        warn $self->name.": select() failed: $!";
-        return undef;
+    my $n;
+    while(1) {
+        my $ein = my $rin = $in;
+        $n = CORE::select($rin, undef, $ein, $self->itertime);
+        $self->_waitresult([$rin,$ein]);
+        if ($n < 0) {
+            next if $!{EINTR};
+            warn $self->name.": select() failed: $!";
+            return undef;
+        }
     }
 
     if ($n == 0) {
-        $self->onidle->($self) if $self->_has_onidle;
+        $self->runcatch($self->onidle, ($self)) if $self->_has_onidle;
         return 0;
     }
 
@@ -119,16 +145,16 @@ sub recv {
         if (vec($rin, $fileno, 1)) {
             if (my $list = $pend->continue) {
                 if (ref $list) {
-                    $pend->onok->($pend->id, $list, $pend, $self);
                     delete $pending->{$shard};
+                    $self->runcatch($pend->onok, ($pend->id, $list, $pend, $self));
                 }
             } else {
-                $pend->close("error while receiving");
+                $pend->close("error while receiving (".$pend->last_error.")");
             }
         } elsif (vec($ein, $fileno, 1)) {
-            $pend->close("connection reset");
+            $pend->close("connection reset (".$pend->last_error.")");
         } elsif ($pend->is_timeout) {
-            $pend->close("timeout");
+            $pend->close("timeout (".$pend->last_error.")");
         }
     }
 
@@ -137,11 +163,12 @@ sub recv {
 
 sub finish {
     my ($self) = @_;
+    my $timeout = !$self->exceptions;
     my $pending = $self->_pending;
     for my $shard (grep { !$pending->{$_}->is_done } keys %$pending) {
         my $pend = delete $pending->{$shard};
-        $pend->close("timeout");
-        $pend->onerror->($pend->id, "timeout", $pend, $self);
+        $pend->close($timeout ? "timeout" : "aborted due to external exception");
+        $self->runcatch($pend->onerror, ($pend->id, "timeout", $pend, $self)) if $timeout;
     }
     return $self;
 }
@@ -150,12 +177,16 @@ sub iter {
     my ($self) = @_;
 
     $self->send or return;
+    return if $self->exceptions;
 
     my $res = $self->wait;
+    return if $self->exceptions;
     return unless defined $res;
     return 1 unless $res;
 
     $self->recv or return;
+    return if $self->exceptions;
+
     return 1;
 }
 
@@ -168,8 +199,18 @@ sub work {
     while(%$pending and time() - $time0 <= $self->maxtime) {
         last unless $self->iter;
     }
-
     $self->finish;
+    $self->check_exceptions('raise');
+}
+
+sub check_exceptions {
+    my ($self, $raise) = @_;
+    my $e = $self->_exceptions;
+    return unless $e && @$e;
+    my $str = "$$: PENDING EXCEPTIONS BEGIN\n".join("\n$$:###################\n", @$e)."$$: PENDING EXCEPTIONS END";
+    die $str if $raise;
+    warn $str if defined $raise;
+    return $str;
 }
 
 no Mouse;
@@ -181,6 +222,7 @@ __PACKAGE__->meta->make_immutable();
 package MR::Pending::Item;
 use Mouse;
 use Time::HiRes qw/time/;
+use Carp;
 
 has id => (
     is        => 'ro',
@@ -192,6 +234,7 @@ has $_ => (
     is        => 'ro',
     isa       => 'CodeRef',
     predicate => "_has_$_",
+    required  => 1,
 ) for qw/onok onerror onretry/;
 
 has $_ => (
@@ -223,6 +266,7 @@ has _connection => (
     isa      => 'Maybe[MR::IProto::Connection::Sync]',
     clearer  => '_clear__connection',
     predicate=> '_has__connection',
+    handles  => [qw/last_error/],
 );
 
 has fileno => (
@@ -251,6 +295,12 @@ has try => (
     default  => 0,
     writer   => '_set_try',
 );
+
+# has bornat => (
+#     is       => 'ro',
+#     isa      => 'Str',
+#     default  => sub { "[".join("-", $_[0], $$, time(), Carp::longmess())."]"; },
+# );
 
 sub is_done     { return  $_[0]->_done }
 sub is_pending  { return !$_[0]->_done &&  $_[0]->_has__connection }
@@ -300,8 +350,6 @@ sub continue {
             }
             return \@list;
         }
-    } else {
-        warn $@;
     }
     return 0;
 }
@@ -314,7 +362,8 @@ sub close {
 
 sub DEMOLISH {
     my ($self) = @_;
-    confess "FORGOTTEN $self" if $self->is_pending;
+    warn "$$ FORGOTTEN $self" if $self->is_pending;
+    #Carp::cluck "$$ FORGOTTEN $self" if $self->is_pending;
 }
 
 no Mouse;
